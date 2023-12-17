@@ -1,0 +1,13 @@
+[package]
+name = "vgroup"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+cgroups-rs = "0.3"
+tokio = { version = "1", features = ["full"] }
+libc = "0.2"
+nix = "0.26"
+futures = "0.3.28"
