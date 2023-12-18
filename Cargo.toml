@@ -7,10 +7,14 @@ edition = "2021"
 
 [dependencies]
 cgroups-rs = "0.3"
-tokio = { version = "1", features = ["full"] }
 libc = "0.2"
 nix = "0.26"
+
+tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1.14"
 futures = "0.3.28"
+futures-util = "0.3.28"
+
 cursive = "0.20.0"
 
 [profile.dev]
