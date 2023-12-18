@@ -2,27 +2,31 @@ extern crate core;
 
 use std::io::Write;
 use std::ops::{Div, Mul};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
-#[allow(unused)]
-use cgroups_rs::*;
 use cgroups_rs::cgroup::CGROUP_MODE_THREADED;
 #[allow(unused)]
 use cgroups_rs::cgroup_builder::*;
 use cgroups_rs::cpu::CpuController;
-use futures::{FutureExt, StreamExt};
+#[allow(unused)]
+use cgroups_rs::*;
 use futures::future::BoxFuture;
 use futures::stream::FuturesUnordered;
+use futures::{FutureExt, StreamExt};
 use tokio::runtime::Runtime;
 use tokio::task::yield_now;
+
+mod ui;
 
 const BACKSPACE: char = 8u8 as char;
 const WORKERS: usize = 3;
 
 // #[tokio::main]
 fn main() {
+    ui::show();
+
     // Create nox/tokio cgroup hierarchy
     let cgroups = make_cgroup(WORKERS);
 
@@ -67,8 +71,10 @@ fn read_limit(threads: Threads, groups: CGroups) {
         std::io::stdin().read_line(&mut action).expect("read");
         let action = action.strip_suffix("\n").expect("strip");
 
-        if action == "stop" {
-            break send_stop(threads);
+        match action {
+            "stop" => break send_stop(threads),
+            "ui" => ui::show(),
+            _ => {}
         }
 
         let action = action.split(" ").collect::<Vec<_>>();
@@ -123,7 +129,11 @@ fn assign_threads(group: &Cgroup, thread_ids: &[u64]) {
     // Move these threads to 'tokio' cgroup
     for tid in thread_ids {
         if let Err(err) = group.add_task(CgroupPid::from(*tid)) {
-            println!("error add thread {tid} to '{}' cgroup: {:?}", group.path(), err);
+            println!(
+                "error add thread {tid} to '{}' cgroup: {:?}",
+                group.path(),
+                err
+            );
         }
     }
     let tasks = group
@@ -219,7 +229,9 @@ fn set_cpu_limit(group: &Cgroup, percent: u64) {
     let period = Some(Duration::from_millis(period).as_micros() as u64);
     let quota = Some(Duration::from_millis(quota).as_micros() as i64);
 
-    let ctrl: &CpuController = group.controller_of().expect("set_cpu_limit: get group controller");
+    let ctrl: &CpuController = group
+        .controller_of()
+        .expect("set_cpu_limit: get group controller");
     ctrl.set_cfs_quota_and_period(quota, period)
         .expect(&format!("set CPU quota to {}", ctrl.path().display()));
 }
@@ -240,19 +252,28 @@ fn make_cgroup(workers: usize) -> CGroups {
         String::from("nox/tokio"),
         Some(vec![String::from("cpuset"), String::from("cpu")]),
     )
-        .expect("create tokio cg");
+    .expect("create tokio cg");
 
+    let workers = (0..workers)
+        .map(|i| {
+            let path = format!("nox/tokio/worker_{}", i);
+            let controllers = vec!["cpuset", "cpu"]
+                .into_iter()
+                .map(|g| g.to_string())
+                .collect();
+            let group = Cgroup::new_with_specified_controllers(auto(), path, Some(controllers))?;
+            // Set cgroup type of the sub-control group is thread mode.
+            group.set_cgroup_type(CGROUP_MODE_THREADED).unwrap();
+            Ok(group)
+        })
+        .collect::<error::Result<_>>()
+        .expect("create worker cgroups");
 
-    let workers = (0..workers).map(|i| {
-        let path = format!("nox/tokio/worker_{}", i);
-        let controllers = vec!["cpuset", "cpu"].into_iter().map(|g| g.to_string()).collect();
-        let group = Cgroup::new_with_specified_controllers(auto(), path, Some(controllers))?;
-        // Set cgroup type of the sub-control group is thread mode.
-        group.set_cgroup_type(CGROUP_MODE_THREADED).unwrap();
-        Ok(group)
-    }).collect::<error::Result<_>>().expect("create worker cgroups");
-
-    CGroups { nox, tokio, workers }
+    CGroups {
+        nox,
+        tokio,
+        workers,
+    }
 }
 
 fn print_group(group: &Cgroup) {
