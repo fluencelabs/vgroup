@@ -2,64 +2,58 @@ extern crate core;
 
 use std::io::Write;
 use std::ops::{Div, Mul};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use cgroups_rs::cgroup::CGROUP_MODE_THREADED;
-#[allow(unused)]
+use cgroups_rs::*;
 use cgroups_rs::cgroup_builder::*;
 use cgroups_rs::cpu::CpuController;
-#[allow(unused)]
-use cgroups_rs::*;
-use futures::future::BoxFuture;
-use futures::stream::FuturesUnordered;
-use futures::{FutureExt, StreamExt};
-use tokio::runtime::Runtime;
-use tokio::task::yield_now;
+use futures::StreamExt;
+
+use crate::cgroups::CGroups;
+use crate::threads::Threads;
+use crate::ui::{CGroupRef, UIEvent};
 
 mod ui;
+mod cgroups;
+mod threads;
 
 const BACKSPACE: char = 8u8 as char;
 const WORKERS: usize = 3;
 
-// #[tokio::main]
 fn main() {
-    ui::show();
+    let workers = read_usize("Workers");
+    let threads = read_usize("Threads");
 
-    // Create nox/tokio cgroup hierarchy
-    let cgroups = make_cgroup(WORKERS);
+    let cgroups = CGroups::new(workers, threads);
 
-    // Retrieve 'nox' cgroup, it's the parent cgroup of the tokio cgroup
-    println!("\n# nox:");
-    print_group(&cgroups.nox);
+    read_usize("Yaay!");
 
-    // Print tokio group before and after cpu limit
-    println!("# tokio:");
-    print_group(&cgroups.tokio);
+    // let (mut siv, tokio, ui) = ui::make();
+    //
+    // tokio.spawn(async move {
+    //     ui.receiver.for_each(|event| {
+    //         let cgroups = cgroups.clone();
+    //         async move {
+    //             match event {
+    //                 UIEvent::CPULimitChanged(CGroupRef::Tokio, limit) => {
+    //                     set_cpu_limit(&cgroups.tokio, limit as u64);
+    //                     // TODO: send as event
+    //                     // print_group(&cgroups.tokio);
+    //                 }
+    //                 UIEvent::CPULimitChanged(CGroupRef::Worker(path), limit) => {
+    //                     if let Some(idx) = path.rsplit("_").take(1).last().map(str::parse::<usize>).transpose().ok().flatten() {
+    //                         let group = &cgroups.workers[idx];
+    //                         set_cpu_limit(group, limit as u64);
+    //                         // TODO: send group info as event
+    //                     }
+    //                 }
+    //             }
+    //         }
+    //     }).await;
+    // });
 
-    // Move current PID to the nox group
-    let pid = libc::pid_t::from(nix::unistd::getpid()) as u64;
-    cgroups.nox.add_task_by_tgid(CgroupPid::from(pid)).unwrap();
-
-    let mut procs = cgroups.nox.procs().into_iter();
-    // Verify that the task is indeed in the x control group
-    assert_eq!(procs.next(), Some(CgroupPid::from(pid)));
-    assert_eq!(procs.next(), None);
-
-    // create tokio runtime with N threads
-    let threads_num = read_threads();
-    let threads = create_threads(threads_num);
-    println!("created threads {:?}", threads.ids);
-
-    let group_size = threads_num / WORKERS;
-    let thread_ids = threads.ids.chunks(group_size);
-    for (i, ids) in thread_ids.enumerate() {
-        // Move groups of threads to 'tokio/worker_$i' cgroup
-        assign_threads(&cgroups.workers[i], ids);
-    }
-
-    read_limit(threads, cgroups);
+    // siv.run()
 }
 
 fn read_limit(threads: Threads, groups: CGroups) {
@@ -73,7 +67,6 @@ fn read_limit(threads: Threads, groups: CGroups) {
 
         match action {
             "stop" => break send_stop(threads),
-            "ui" => ui::show(),
             _ => {}
         }
 
@@ -113,16 +106,16 @@ fn send_stop(threads: Threads) {
     println!("Done.");
 }
 
-fn read_threads() -> usize {
-    print!("Threads: _{BACKSPACE}");
+fn read_usize(title: &str) -> usize {
+    print!("{title}: _{BACKSPACE}");
     std::io::stdout().flush().expect("flush");
 
-    let mut threads = String::new();
-    std::io::stdin().read_line(&mut threads).expect("read");
-    let threads = threads.strip_suffix("\n").expect("strip");
-    let threads = threads.parse().expect("parse");
+    let mut number = String::new();
+    std::io::stdin().read_line(&mut number).expect("read");
+    let number = number.strip_suffix("\n").expect("strip");
+    let number = number.parse().expect("parse");
 
-    threads
+    number
 }
 
 fn assign_threads(group: &Cgroup, thread_ids: &[u64]) {
@@ -148,76 +141,6 @@ fn get_tid() -> u64 {
     unsafe { libc::syscall(libc::SYS_gettid) as u64 }
 }
 
-struct Threads {
-    stop: Arc<AtomicBool>,
-    join: BoxFuture<'static, ()>,
-    ids: Vec<u64>,
-    runtime: Runtime,
-}
-
-async fn thread_body(stop: Arc<AtomicBool>) {
-    yield_now().await;
-    loop {
-        if stop.load(Ordering::SeqCst) {
-            println!("thread stopped: {}", get_tid());
-            std::io::stdout().flush().expect("flush");
-            break;
-        }
-
-        let floats: Vec<f64> = (1..1000000).map(|n| 1f64 / n as f64).collect::<Vec<_>>();
-        let sum: f64 = floats.clone().into_iter().sum();
-        let floats = floats
-            .clone()
-            .into_iter()
-            .map(|f| {
-                let exp = f.exp();
-                let exp2 = f.exp2();
-
-                sum.div(exp) - exp2.div(sum)
-            })
-            .collect::<Vec<_>>();
-        let sum: f64 = floats.into_iter().sum::<f64>() + sum;
-        if sum < 0f64 {
-            println!("DID NOT EXPECT THAT");
-        }
-    }
-}
-
-fn create_threads(n: usize) -> Threads {
-    use tokio::runtime::Builder;
-
-    // let (sender, receiver) = tokio::sync::mpsc::channel(n);
-    let (sender, receiver) = std::sync::mpsc::channel();
-    let runtime = Builder::new_multi_thread()
-        .worker_threads(n)
-        .max_blocking_threads(1)
-        .on_thread_start(move || {
-            let tid = get_tid();
-            println!("thread started: {}", tid);
-            sender.send(tid).expect("send");
-        })
-        .build()
-        .expect("build tokio runtime");
-
-    let stop = Arc::new(AtomicBool::new(false));
-    let join = (0..n)
-        .map(|_| runtime.spawn(thread_body(stop.clone())))
-        .collect::<FuturesUnordered<_>>()
-        .collect::<Vec<_>>()
-        .map(|_| ())
-        .boxed();
-
-    // TODO: it's possible it will hang here without any way to notify user
-    let thread_ids = receiver.into_iter().take(n).collect::<Vec<_>>();
-
-    Threads {
-        stop,
-        join,
-        ids: thread_ids,
-        runtime,
-    }
-}
-
 /// Set cpu controller period to 10 ms by default. Why not?
 const PERIOD_MS: u64 = 10;
 
@@ -234,46 +157,6 @@ fn set_cpu_limit(group: &Cgroup, percent: u64) {
         .expect("set_cpu_limit: get group controller");
     ctrl.set_cfs_quota_and_period(quota, period)
         .expect(&format!("set CPU quota to {}", ctrl.path().display()));
-}
-
-struct CGroups {
-    nox: Cgroup,
-    tokio: Cgroup,
-    workers: Vec<Cgroup>,
-}
-
-fn make_cgroup(workers: usize) -> CGroups {
-    use cgroups_rs::hierarchies::auto;
-
-    let nox = Cgroup::new(auto(), String::from("nox")).unwrap();
-
-    let tokio = Cgroup::new_with_specified_controllers(
-        auto(),
-        String::from("nox/tokio"),
-        Some(vec![String::from("cpuset"), String::from("cpu")]),
-    )
-    .expect("create tokio cg");
-
-    let workers = (0..workers)
-        .map(|i| {
-            let path = format!("nox/tokio/worker_{}", i);
-            let controllers = vec!["cpuset", "cpu"]
-                .into_iter()
-                .map(|g| g.to_string())
-                .collect();
-            let group = Cgroup::new_with_specified_controllers(auto(), path, Some(controllers))?;
-            // Set cgroup type of the sub-control group is thread mode.
-            group.set_cgroup_type(CGROUP_MODE_THREADED).unwrap();
-            Ok(group)
-        })
-        .collect::<error::Result<_>>()
-        .expect("create worker cgroups");
-
-    CGroups {
-        nox,
-        tokio,
-        workers,
-    }
 }
 
 fn print_group(group: &Cgroup) {

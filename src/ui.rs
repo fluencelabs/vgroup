@@ -5,9 +5,10 @@ use std::ops::Deref;
 use std::sync::Mutex;
 use std::time::Duration;
 
+use cursive::{Cursive, CursiveRunnable, Printer};
 use cursive::event::Event;
 use cursive::logger::Record;
-use cursive::reexports::log::{log, Level};
+use cursive::reexports::log::{Level, log};
 use cursive::theme::{BaseColor, Color, Theme};
 use cursive::traits::*;
 use cursive::view::SizeConstraint;
@@ -15,7 +16,6 @@ use cursive::views::{
     Button, DebugView, Dialog, DummyView, EditView, LinearLayout, ListView, Panel, ResizedView,
     SelectView, SliderView, TextArea, TextContent, TextView, ThemedView,
 };
-use cursive::{Cursive, CursiveRunnable, Printer};
 use futures::executor::block_on;
 use futures_util::StreamExt;
 use tokio::runtime::Runtime;
@@ -23,24 +23,30 @@ use tokio::sync::mpsc::{Sender, UnboundedReceiver, UnboundedSender};
 use tokio::time::sleep;
 use tokio_stream::wrappers::ReceiverStream;
 
+use crate::ui::CGroupRef::Worker;
 use crate::ui::Names::WorkersList;
+use crate::ui::UIEvent::CPULimitChanged;
 
-// use cursive_core::traits::Resizable;
-
-fn worker_item(path: &str, percent: usize) -> LinearLayout {
-    let mut path = TextView::new_with_content(TextContent::new(format!("{path}  ")));
+fn worker_item(path: String, percent: usize, sender: Sender<UIEvent>) -> LinearLayout {
+    let mut path_view = TextView::new_with_content(TextContent::new(format!("{path}  ")));
 
     let mut percent_content = TextContent::new(format!("  {percent}%  "));
     let mut percent_label = TextView::new_with_content(percent_content.clone());
 
     let mut slider = SliderView::horizontal(100)
-        .on_change(move |s, percent| percent_content.set_content(format!("  {percent}%  ")));
+        .on_change(move |s, percent| {
+            percent_content.set_content(format!("  {percent}%  "));
+            let sent = block_on(sender.send(CPULimitChanged(Worker(path.clone()), percent)));
+            if let Err(err) = sent {
+                panic!("error sending CPULimitChanged event: {}", err);
+            }
+        });
 
     slider.set_value(percent);
     let slider = slider.max_width(20);
 
     let layout = LinearLayout::horizontal()
-        .child(path)
+        .child(path_view)
         .child(slider)
         .child(percent_label);
 
@@ -55,7 +61,7 @@ pub enum ControlEvent {
 #[derive(Debug, Clone)]
 pub enum CGroupRef {
     Tokio,
-    Worker(usize),
+    Worker(String),
 }
 
 #[derive(Debug, Clone)]
@@ -87,7 +93,7 @@ impl UIRuntime {
         let (to_control, from_ui) = tokio::sync::mpsc::channel(100);
         let runtime = Builder::new_multi_thread()
             .enable_time()
-            .worker_threads(2)
+            .worker_threads(1)
             .max_blocking_threads(1)
             .build()
             .expect("build UI tokio runtime");
@@ -141,7 +147,7 @@ impl Deref for Names {
 
 // on worker created => populate list view, show info about cgroups
 // on progress changed => change limit
-pub fn show() {
+pub fn make() -> (CursiveRunnable, Runtime, UIRef) {
     let runtime = UIRuntime::create();
 
     let mut siv = cursive::default();
@@ -187,42 +193,19 @@ pub fn show() {
     } = runtime;
 
     tokio.spawn(async move {
-        // println!("Control started.");
-
-        sleep(Duration::from_secs(1)).await;
-        // println!("Control slept.");
-
-        ui_ref
-            .sender
-            .send(ControlEvent::WorkersCreated(vec![
-                "/nox/tokio/worker_0".into()
-            ]))
-            .await;
-
-        sleep(Duration::from_secs(1)).await;
-
-        ui_ref
-            .sender
-            .send(ControlEvent::WorkersCreated(vec![
-                "/nox/tokio/worker_1".into()
-            ]))
-            .await;
-
-        sleep(Duration::from_secs(3)).await;
-    });
-
-    tokio.spawn(async move {
         // EventBus TODO:
         // read events from control
         //  WorkersCreated => populate list view
         // println!("EventBus started.");
-        let receive_control = control_ref.receiver.for_each(|event: ControlEvent| {
+        let sender = control_ref.sender;
+        let receive_control = control_ref.receiver.for_each(move |event: ControlEvent| {
+            let sender = sender.clone();
             let siv_sink = siv_sink.clone();
             // println!("EventBus event {event:?}");
             async move {
                 match event {
                     ControlEvent::WorkersCreated(workers) => {
-                        siv_sink.send(Box::new(move |cursive| add_workers(cursive, &workers)));
+                        siv_sink.send(Box::new(move |cursive| add_workers(cursive, workers, sender)));
                     }
                 }
             }
@@ -239,20 +222,17 @@ pub fn show() {
     // move ui_ref to control
     // use ui_ref in control to send WorkersCreated
 
-    siv.run();
+    (siv, tokio, ui_ref)
 }
 
-fn add_workers(cursive: &mut Cursive, worker_paths: &[String]) {
+fn add_workers(cursive: &mut Cursive, worker_paths: Vec<String>, sender: Sender<UIEvent>) {
     let ret = cursive.call_on_name(&WorkersList, |list: &mut ListView| {
         for worker in worker_paths {
             // println!("add worker {worker}");
-            list.add_child("", worker_item(&worker, 50));
+            list.add_child("", worker_item(worker, 50, sender.clone()));
         }
     });
     assert!(ret.is_some(), "call_on_name failed");
-    if ret.is_none() {
-        // println!("call on name failed: {}", WorkersList.as_ref());
-    }
 }
 
 fn debug_view() {
@@ -278,16 +258,16 @@ fn add_name(s: &mut Cursive) {
                 .with_name("name")
                 .fixed_width(10),
         )
-        .title("Enter a new name")
-        .button("Ok", |s| {
-            let name = s
-                .call_on_name("name", |view: &mut EditView| view.get_content())
-                .unwrap();
-            ok(s, &name);
-        })
-        .button("Cancel", |s| {
-            s.pop_layer();
-        }),
+            .title("Enter a new name")
+            .button("Ok", |s| {
+                let name = s
+                    .call_on_name("name", |view: &mut EditView| view.get_content())
+                    .unwrap();
+                ok(s, &name);
+            })
+            .button("Cancel", |s| {
+                s.pop_layer();
+            }),
     );
 }
 
