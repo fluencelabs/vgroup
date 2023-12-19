@@ -1,13 +1,13 @@
 #![allow(unused)]
 
 use std::fmt::format;
-use std::sync::Arc;
+use std::ops::Deref;
+use std::sync::Mutex;
 use std::time::Duration;
 
-use cursive::{Cursive, CursiveRunnable, Printer};
 use cursive::event::Event;
 use cursive::logger::Record;
-use cursive::reexports::log::{Level, log};
+use cursive::reexports::log::{log, Level};
 use cursive::theme::{BaseColor, Color, Theme};
 use cursive::traits::*;
 use cursive::view::SizeConstraint;
@@ -15,12 +15,15 @@ use cursive::views::{
     Button, DebugView, Dialog, DummyView, EditView, LinearLayout, ListView, Panel, ResizedView,
     SelectView, SliderView, TextArea, TextContent, TextView, ThemedView,
 };
+use cursive::{Cursive, CursiveRunnable, Printer};
 use futures::executor::block_on;
 use futures_util::StreamExt;
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc::{Sender, UnboundedReceiver, UnboundedSender};
-use tokio::sync::Mutex;
+use tokio::time::sleep;
 use tokio_stream::wrappers::ReceiverStream;
+
+use crate::ui::Names::WorkersList;
 
 // use cursive_core::traits::Resizable;
 
@@ -83,7 +86,8 @@ impl UIRuntime {
         let (to_ui, from_control) = tokio::sync::mpsc::channel(100);
         let (to_control, from_ui) = tokio::sync::mpsc::channel(100);
         let runtime = Builder::new_multi_thread()
-            .worker_threads(1)
+            .enable_time()
+            .worker_threads(2)
             .max_blocking_threads(1)
             .build()
             .expect("build UI tokio runtime");
@@ -108,21 +112,44 @@ impl UIRuntime {
     }
 }
 
+#[derive(Debug, Clone)]
+pub enum Names {
+    WorkersList,
+}
+
+impl Into<String> for Names {
+    fn into(self) -> String {
+        String::from(AsRef::<str>::as_ref(&self))
+    }
+}
+
+impl AsRef<str> for Names {
+    fn as_ref(&self) -> &str {
+        match self {
+            Names::WorkersList => "workers_list",
+        }
+    }
+}
+
+impl Deref for Names {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        AsRef::<str>::as_ref(self)
+    }
+}
+
 // on worker created => populate list view, show info about cgroups
 // on progress changed => change limit
-
 pub fn show() {
     let runtime = UIRuntime::create();
 
     let mut siv = cursive::default();
+
     siv.set_theme(Theme::terminal_default());
 
-    let mut workers_list = Arc::new(ListView::new());
-    // left_select.add_child("", worker_item("nox/tokio/worker_1", 10));
-    // left_select.add_child("", worker_item("nox/tokio/worker_1", 25));
-    // left_select.add_child("", worker_item("nox/tokio/worker_2", 76));
-    let workers_panel = Panel::new(workers_list.clone());
-    let workers_list = Mutex::new(workers_list);
+    let mut workers_list = ListView::new().with_name(WorkersList);
+    let workers_panel = Panel::new(workers_list).full_width();
 
     let mut left_text = TextContent::new("left begins:\n");
     let mut left = TextView::new_with_content(left_text.clone())
@@ -151,9 +178,7 @@ pub fn show() {
     // TUI TODO:
     // send CPULimitChanged to control
 
-    // let join_siv = runtime.tokio.spawn(tokio::task::block_in_place(siv.run()));
-    // I HEREBY DECLARE: the single blocking thread is the TUI thread. Why not?
-    let join_siv = runtime.tokio.spawn_blocking(move || siv.run());
+    let siv_sink = siv.cb_sink().clone();
 
     let UIRuntime {
         ui_ref,
@@ -161,50 +186,73 @@ pub fn show() {
         tokio,
     } = runtime;
 
-    let join_eventbus = tokio.spawn(async move {
+    tokio.spawn(async move {
+        // println!("Control started.");
+
+        sleep(Duration::from_secs(1)).await;
+        // println!("Control slept.");
+
+        ui_ref
+            .sender
+            .send(ControlEvent::WorkersCreated(vec![
+                "/nox/tokio/worker_0".into()
+            ]))
+            .await;
+
+        sleep(Duration::from_secs(1)).await;
+
+        ui_ref
+            .sender
+            .send(ControlEvent::WorkersCreated(vec![
+                "/nox/tokio/worker_1".into()
+            ]))
+            .await;
+
+        sleep(Duration::from_secs(3)).await;
+    });
+
+    tokio.spawn(async move {
         // EventBus TODO:
         // read events from control
         //  WorkersCreated => populate list view
-        let receive_control = control_ref
-            .receiver
-            .for_each(|event: ControlEvent| async move {
+        // println!("EventBus started.");
+        let receive_control = control_ref.receiver.for_each(|event: ControlEvent| {
+            let siv_sink = siv_sink.clone();
+            // println!("EventBus event {event:?}");
+            async move {
                 match event {
                     ControlEvent::WorkersCreated(workers) => {
-                        let mut workers_list = workers_list.lock().await;
-                        for worker in workers {
-                            workers_list.add_child("", worker_item(&worker, 50));
-                        }
+                        siv_sink.send(Box::new(move |cursive| add_workers(cursive, &workers)));
                     }
                 }
-            });
+            }
+        });
 
-        tokio::select! {
-            _ = receive_control => {}
-        }
+        receive_control.await;
+
+        // tokio::select! {
+        //     _ = receive_control => {}
+        // }
     });
-
-    std::thread::sleep(Duration::from_secs(1));
-
-    tokio.spawn(ui_ref
-        .sender
-        .send(ControlEvent::WorkersCreated(vec![
-            "/nox/tokio/worker_0".into()
-        ])));
-
-    std::thread::sleep(Duration::from_secs(1));
-
-    tokio.spawn(ui_ref
-        .sender
-        .send(ControlEvent::WorkersCreated(vec![
-            "/nox/tokio/worker_1".into()
-        ]))
-    );
-
-    std::thread::sleep(Duration::from_secs(3));
 
     // Control TODO:
     // move ui_ref to control
     // use ui_ref in control to send WorkersCreated
+
+    siv.run();
+}
+
+fn add_workers(cursive: &mut Cursive, worker_paths: &[String]) {
+    let ret = cursive.call_on_name(&WorkersList, |list: &mut ListView| {
+        for worker in worker_paths {
+            // println!("add worker {worker}");
+            list.add_child("", worker_item(&worker, 50));
+        }
+    });
+    assert!(ret.is_some(), "call_on_name failed");
+    if ret.is_none() {
+        // println!("call on name failed: {}", WorkersList.as_ref());
+    }
 }
 
 fn debug_view() {
@@ -230,16 +278,16 @@ fn add_name(s: &mut Cursive) {
                 .with_name("name")
                 .fixed_width(10),
         )
-            .title("Enter a new name")
-            .button("Ok", |s| {
-                let name = s
-                    .call_on_name("name", |view: &mut EditView| view.get_content())
-                    .unwrap();
-                ok(s, &name);
-            })
-            .button("Cancel", |s| {
-                s.pop_layer();
-            }),
+        .title("Enter a new name")
+        .button("Ok", |s| {
+            let name = s
+                .call_on_name("name", |view: &mut EditView| view.get_content())
+                .unwrap();
+            ok(s, &name);
+        })
+        .button("Cancel", |s| {
+            s.pop_layer();
+        }),
     );
 }
 
